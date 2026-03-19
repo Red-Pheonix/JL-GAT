@@ -1,62 +1,79 @@
 import json
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import Dict, List, Optional, Union
 
-def parse_pairs(text: str) -> List[Tuple[int, int]]:
-    pairs = []
-    for line in text.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = [p.strip() for p in line.split(",") if p.strip() != ""]
-        if len(parts) < 2:
-            continue
-        t = int(parts[0])
-        ph = int(parts[1])
-        pairs.append((t, ph))
-    pairs.sort(key=lambda x: x[0])
-    return pairs
+import pandas as pd
 
-def merge_same_phase(pairs: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    if not pairs:
-        return []
-    merged = [pairs[0]]
-    for t, ph in pairs[1:]:
-        if ph == merged[-1][1]:
-            continue
-        merged.append((t, ph))
-    return merged
 
-def to_single_arrows(pairs: List[Tuple[int, int]]) -> dict:
+def build_arrows_for_series(times: pd.Series, phases: pd.Series, node_id: str, phase_offset: int = 1):
+    # keep only rows where phase changes (and always include the first)
+    changed = phases.ne(phases.shift(1))
+    t = times[changed].astype(int).to_list()
+    p = phases[changed].astype(int).to_list()
+
     arrows = []
-    for (t0, p0), (t1, p1) in zip(pairs, pairs[1:]):
+    for (t0, p0), (t1, p1) in zip(zip(t, p), zip(t[1:], p[1:])):
         arrows.append({
-            "from_phase": p0 + 1,
-            "from_time": t0,
-            "to_phase": p1 + 1,
-            "to_time": t1,
+            "node_id": node_id,
+            "from_phase": int(p0) + phase_offset,
+            "from_time": int(t0),
+            "to_phase": int(p1) + phase_offset,
+            "to_time": int(t1),
         })
-    return {"single_arrows": arrows}
+    return arrows
 
-def convert(source: Union[str, Path], *, merge_phases: bool = True, source_is_file: bool = True) -> dict:
-    """
-    source_is_file=True  -> treat `source` as a filename/path and read it
-    source_is_file=False -> treat `source` as raw CSV-like text
-    """
-    if source_is_file:
-        text = Path(source).read_text(encoding="utf-8")
-    else:
-        text = str(source)
 
-    pairs = parse_pairs(text)
-    if merge_phases:
-        pairs = merge_same_phase(pairs)
-    return to_single_arrows(pairs)
+def convert_all_intersections(
+    source: Union[str, Path],
+    *,
+    time_col: str = "timestep",
+    mode: Optional[str] = None,
+    epoch: Optional[int] = None,
+    meta_cols: Optional[List[str]] = None,
+    phase_offset: int = 1,
+) -> Dict:
+    df = pd.read_csv(source)
 
-def convert_file(in_path: str, out_path: str = "single_arrows.json", *, merge_phases: bool = True) -> None:
-    data = convert(in_path, merge_phases=merge_phases, source_is_file=True)
+    # filter if requested
+    if mode is not None and "mode" in df.columns:
+        df = df[df["mode"] == mode]
+    if epoch is not None and "epoch" in df.columns:
+        df = df[df["epoch"].astype(int) == int(epoch)]
+
+    # sort by time (important after filtering)
+    df = df.sort_values(time_col, kind="stable")
+
+    # autodetect intersection columns
+    if meta_cols is None:
+        meta_cols = [c for c in ["mode", "epoch", time_col] if c in df.columns]
+    intersection_cols = [c for c in df.columns if c not in meta_cols]
+
+    times = df[time_col]
+    all_arrows = []
+    for col in intersection_cols:
+        all_arrows.extend(build_arrows_for_series(times, df[col], node_id=str(col), phase_offset=phase_offset))
+
+    return {"single_arrows": all_arrows}
+
+
+def convert_file_all(
+    in_path: str,
+    out_path: str = "single_arrows_all.json",
+    *,
+    time_col: str = "timestep",
+    mode: Optional[str] = None,
+    epoch: Optional[int] = None,
+    phase_offset: int = 1,
+) -> None:
+    data = convert_all_intersections(
+        in_path,
+        time_col=time_col,
+        mode=mode,
+        epoch=epoch,
+        phase_offset=phase_offset,
+    )
     Path(out_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
     print(f"Wrote {out_path} ({len(data['single_arrows'])} arrows)")
+    
 
-# ---- usage ----
-convert_file("actions_log.csv", "single_arrows.json", merge_phases=True)
+convert_file_all("ACTION.log", "single_arrows.json", mode="train", epoch=4)
